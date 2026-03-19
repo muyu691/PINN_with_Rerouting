@@ -55,6 +55,11 @@ model:
   type: topology_gnn
   loss_fun: l1
   lambda_eq: 1.0
+  lambda_old: 1.0
+  lambda_new_start: 1.0
+  lambda_new_final: 6.0
+  lambda_new_warmup_epochs: 40
+  lambda_new_schedule: linear
   graph_pooling: none
 
 gt:

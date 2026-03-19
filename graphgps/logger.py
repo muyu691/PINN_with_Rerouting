@@ -16,7 +16,7 @@ from torchmetrics.functional import auroc
 
 # OGB metrics not included in clean version (only for OGB datasets)
 # import graphgps.metrics_ogb as metrics_ogb
-from graphgps.metric_wrapper import MetricWrapper, wmape
+from graphgps.metric_wrapper import MetricWrapper, get_flow_metric_tensors, wmape
 
 
 # Stub module for OGB metrics (not used in Sioux Falls regression task)
@@ -214,19 +214,24 @@ class CustomLogger(Logger):
         elif true.ndim == 1 and pred.ndim == 2:
             true = true.view(-1, 1)
 
+        # For the traffic network-pairs task, report regression metrics in real
+        # flow units so epoch-level logs stay in the same physical space as the
+        # detailed evaluation report.
+        pred_metric, true_metric, _ = get_flow_metric_tensors(pred, true)
+
         reformat = lambda x: round(float(x), cfg.round)
 
         import math
-        spearman_val = eval_spearmanr(true.numpy(), pred.numpy())['spearmanr']
+        spearman_val = eval_spearmanr(true_metric.numpy(), pred_metric.numpy())['spearmanr']
         if math.isnan(spearman_val):
             spearman_val = 0.0
 
         return {
-            'mae': reformat(mean_absolute_error(true, pred)),
-            'r2': reformat(r2_score(true, pred, multioutput='uniform_average')),
-            'mse': reformat(mean_squared_error(true, pred)),
-            'rmse': reformat(mean_squared_error(true, pred, squared=False)),
-            'wmape': reformat(wmape(pred, true)),
+            'mae': reformat(mean_absolute_error(true_metric, pred_metric)),
+            'r2': reformat(r2_score(true_metric, pred_metric, multioutput='uniform_average')),
+            'mse': reformat(mean_squared_error(true_metric, pred_metric)),
+            'rmse': reformat(mean_squared_error(true_metric, pred_metric, squared=False)),
+            'wmape': reformat(wmape(pred_metric, true_metric)),
         }
 
     def update_stats(self, true, pred, loss, lr, time_used, params,

@@ -4,6 +4,7 @@ from typing import Union, Callable, Optional, Dict, Any
 import warnings
 
 import torch
+from torch_geometric.graphgym.config import cfg
 from torchmetrics.functional import (
     accuracy,
     average_precision,
@@ -21,6 +22,56 @@ from torchmetrics.functional import (
 from torchmetrics.utilities import reduce
 
 EPS = 1e-5
+
+
+def use_denormalized_flow_metrics(cfg_node=None) -> bool:
+    """Enable real-flow metrics only for network-pairs style traffic datasets.
+
+    The repository defines ``flow_mean`` / ``flow_std`` globally in the dataset
+    config, so presence alone is not enough to decide whether WMAPE should be
+    denormalized. Restricting this path to ``PyG-NetworkPairs`` keeps other
+    datasets on the legacy metric space.
+    """
+    cfg_node = cfg if cfg_node is None else cfg_node
+    dataset_cfg = getattr(cfg_node, 'dataset', None)
+    if dataset_cfg is None:
+        return False
+    if getattr(dataset_cfg, 'format', None) != 'PyG-NetworkPairs':
+        return False
+    return hasattr(dataset_cfg, 'flow_mean') and hasattr(dataset_cfg, 'flow_std')
+
+
+def get_flow_metric_tensors(
+    preds: torch.Tensor,
+    target: torch.Tensor,
+    cfg_node=None,
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    """Return tensors in the canonical evaluation space for traffic flow.
+
+    For the network-pairs traffic task, metrics should be reported in
+    denormalized real-flow space, while the training loss remains in normalized
+    space. Other datasets are returned unchanged for backward compatibility.
+    """
+    preds = preds.to(torch.float32)
+    target = target.to(torch.float32)
+
+    if not use_denormalized_flow_metrics(cfg_node):
+        return preds, target, False
+
+    cfg_node = cfg if cfg_node is None else cfg_node
+    flow_mean = float(getattr(cfg_node.dataset, 'flow_mean', 0.0))
+    flow_std = float(getattr(cfg_node.dataset, 'flow_std', 1.0))
+    return preds * flow_std + flow_mean, target * flow_std + flow_mean, True
+
+
+def traffic_wmape(preds: torch.Tensor, target: torch.Tensor, cfg_node=None) -> torch.Tensor:
+    """Compute the canonical WMAPE in the correct physical space for traffic."""
+    preds_eval, target_eval, _ = get_flow_metric_tensors(preds, target, cfg_node)
+    return wmape(preds_eval, target_eval)
+
+
+def flow_metric_space_tag(cfg_node=None) -> str:
+    return "denormalized (veh/hr)" if use_denormalized_flow_metrics(cfg_node) else "normalized"
 
 
 class Thresholder:
@@ -93,19 +144,17 @@ def rmse(preds: torch.Tensor, target: torch.Tensor, **kwargs) -> torch.Tensor:
 
 def wmape(preds: torch.Tensor, target: torch.Tensor, **kwargs) -> torch.Tensor:
     """
-    Computes the Weighted Mean Absolute Percentage Error.
+    Compute the canonical Weighted Mean Absolute Percentage Error.
 
-    Formula: WMAPE = sum(|pred - target|) / sum(target)
+    Formula: WMAPE = sum(abs(pred - target)) / sum(abs(target))
 
-    Unlike the standard MAPE which averages per-sample percentage errors
-    (and is unstable when individual target values are near zero), WMAPE
-    weights the absolute error by the total target volume, making it robust
-    for traffic flow distributions that include near-zero values.
+    Using ``abs(target)`` in the denominator is the standard aggregate WMAPE
+    definition and keeps the metric well-defined if targets are signed.
     """
-    preds  = preds.to(torch.float32)
+    preds = preds.to(torch.float32)
     target = target.to(torch.float32)
     sum_abs_error = torch.sum(torch.abs(preds - target))
-    sum_target    = torch.clamp(torch.sum(target), min=EPS)
+    sum_target = torch.clamp(torch.sum(torch.abs(target)), min=EPS)
     return sum_abs_error / sum_target
 
 

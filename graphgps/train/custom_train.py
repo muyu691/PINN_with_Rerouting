@@ -19,7 +19,7 @@ from graphgps.utils import cfg_to_dict, flatten_dict, make_wandb_name, match_edg
 #         batch-level topology info like batch.edge_index_new, batch.non_centroid_mask, etc.
 from graphgps.loss.flow_conservation_loss import compute_pinn_loss
 
-from graphgps.metric_wrapper import wmape
+from graphgps.metric_wrapper import flow_metric_space_tag, get_flow_metric_tensors, wmape
 from torchmetrics.functional import mean_absolute_error
 
 
@@ -52,6 +52,19 @@ def _compute_loss(pred, true, batch):
         return compute_loss(pred, true)
 
 
+def _collect_batch_loss_stats(batch):
+    """Pull optional PINN diagnostics off the batch for logger aggregation."""
+    stats = {}
+    for key in ('loss_old', 'loss_new', 'lambda_new_current', 'loss_data', 'loss_eq'):
+        if not hasattr(batch, key):
+            continue
+        value = getattr(batch, key)
+        if torch.is_tensor(value):
+            value = value.detach().cpu().item()
+        stats[key] = float(value)
+    return stats
+
+
 def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation):
     model.train()
     optimizer.zero_grad()
@@ -69,6 +82,7 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
             loss, pred_score = _compute_loss(pred, true, batch)
             _true = true.detach().to('cpu', non_blocking=True)
             _pred = pred_score.detach().to('cpu', non_blocking=True)
+        batch_loss_stats = _collect_batch_loss_stats(batch)
         loss.backward()
         # Parameters update after accumulating gradients for given num. batches.
         if ((iter + 1) % batch_accumulation == 0) or (iter + 1 == len(loader)):
@@ -83,7 +97,8 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
                             lr=scheduler.get_last_lr()[0],
                             time_used=time.time() - time_start,
                             params=cfg.params,
-                            dataset_name=cfg.dataset.name)
+                            dataset_name=cfg.dataset.name,
+                            **batch_loss_stats)
         time_start = time.time()
 
 
@@ -108,13 +123,15 @@ def eval_epoch(logger, loader, model, split='val'):
             loss, pred_score = _compute_loss(pred, true, batch)
             _true = true.detach().to('cpu', non_blocking=True)
             _pred = pred_score.detach().to('cpu', non_blocking=True)
+        batch_loss_stats = _collect_batch_loss_stats(batch)
         logger.update_stats(true=_true,
                             pred=_pred,
                             loss=loss.detach().cpu().item(),
                             lr=0, time_used=time.time() - time_start,
                             params=cfg.params,
                             dataset_name=cfg.dataset.name,
-                            **extra_stats)
+                            **extra_stats,
+                            **batch_loss_stats)
         time_start = time.time()
 
 
@@ -146,8 +163,10 @@ def detailed_test_evaluation(loader, model, split='test'):
       2. New-edge vs Old-edge  → WMAPE, MAE for each subset
       3. Inference timing → average time per graph (GPU-aware)
 
-    All WMAPE / MAE are computed in **denormalized** (real flow) space when
-    cfg.dataset.flow_mean / flow_std are available, otherwise in normalized space.
+    For the network-pairs traffic task, WMAPE is computed in denormalized
+    real-flow space so it matches the epoch logger. The detailed report keeps
+    its denormalized MAE for edge-subset analysis. Other datasets stay in
+    their original metric space.
 
     Args:
         loader : DataLoader for the target split (typically test)
@@ -156,10 +175,6 @@ def detailed_test_evaluation(loader, model, split='test'):
     """
     model.eval()
     device = torch.device(cfg.accelerator)
-
-    flow_mean = getattr(cfg.dataset, 'flow_mean', 0.0)
-    flow_std = getattr(cfg.dataset, 'flow_std', 1.0)
-    use_denorm = not (flow_mean == 0.0 and flow_std == 1.0)
 
     per_graph_wmapes = []
 
@@ -203,13 +218,9 @@ def detailed_test_evaluation(loader, model, split='test'):
         pred_cpu = pred.detach().cpu().float()
         true_cpu = true.detach().cpu().float()
 
-        # Denormalize: real_flow = scaled * std + mean
-        if use_denorm:
-            pred_real = pred_cpu * flow_std + flow_mean
-            true_real = true_cpu * flow_std + flow_mean
-        else:
-            pred_real = pred_cpu
-            true_real = true_cpu
+        # Reuse the same traffic-specific metric space as the epoch logger so
+        # WMAPE is reported consistently across both logging paths.
+        pred_real, true_real, _ = get_flow_metric_tensors(pred_cpu, true_cpu)
 
         # ── Per-graph WMAPE ─────────────────────────────────────────────
         edge_idx = getattr(batch, 'edge_index_new', batch.edge_index)
@@ -240,7 +251,7 @@ def detailed_test_evaluation(loader, model, split='test'):
     # ════════════════════════════════════════════════════════════════════
     # Aggregate & Log
     # ════════════════════════════════════════════════════════════════════
-    space_tag = "denormalized (veh/hr)" if use_denorm else "normalized"
+    space_tag = flow_metric_space_tag()
 
     # ── 1. WMAPE Percentiles ────────────────────────────────────────────
     if per_graph_wmapes:
@@ -353,12 +364,14 @@ def custom_train(loggers, loaders, model, optimizer, scheduler):
     perf = [[] for _ in range(num_splits)]
     for cur_epoch in range(start_epoch, cfg.optim.max_epoch):
         start_time = time.perf_counter()
+        cfg.train.current_epoch = cur_epoch
         train_epoch(loggers[0], loaders[0], model, optimizer, scheduler,
                     cfg.optim.batch_accumulation)
         perf[0].append(loggers[0].write_epoch(cur_epoch))
 
         if is_eval_epoch(cur_epoch):
             for i in range(1, num_splits):
+                cfg.train.current_epoch = cur_epoch
                 eval_epoch(loggers[i], loaders[i], model,
                            split=split_names[i - 1])
                 perf[i].append(loggers[i].write_epoch(cur_epoch))
@@ -472,6 +485,9 @@ def inference_only(loggers, loaders, model, optimizer=None, scheduler=None):
     perf = [[] for _ in range(num_splits)]
     cur_epoch = 0
     start_time = time.perf_counter()
+    # Inference-only runs evaluate a finished checkpoint, so use the fully
+    # ramped new-edge weight rather than the epoch-0 warmup value.
+    cfg.train.current_epoch = getattr(cfg.optim, 'max_epoch', 0)
 
     for i in range(0, num_splits):
         eval_epoch(loggers[i], loaders[i], model,
