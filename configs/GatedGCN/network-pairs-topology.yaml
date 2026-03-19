@@ -1,0 +1,88 @@
+out_dir: results
+metric_best: mae
+metric_agg: argmin
+name_tag: network-pairs-topology-pinn
+
+wandb:
+  use: False
+  project: network-pairs-topology
+  entity: your-wandb-entity
+
+dataset:
+  format: PyG-NetworkPairs
+  name: network-pairs-topology
+  dataset_name: traffic-network-pairs
+  network_name: SiouxFalls
+  dataset_root: sioux_data
+  network_file: ''
+  od_file: ''
+  parser: tntp
+  processed_root: create_sioux_data/processed_data/pyg_dataset
+  node_id_offset: 1
+  centroid_nodes: ''
+  demand_source: lhs
+  num_nodes: 0
+  num_edges_old: 0
+  num_edges_new: 0
+  od_dim: 0
+  centroid_count: 0
+  task: graph
+  task_type: regression
+  transductive: False
+  dir: create_sioux_data/processed_data/pyg_dataset
+  flow_mean: 0.0
+  flow_std: 1.0
+  node_encoder: False
+  edge_encoder: False
+  use_virtual_links: True
+  mask_capacity: False
+  mask_fft: False
+
+posenc_LapPE:
+  enable: False
+posenc_RWSE:
+  enable: False
+
+train:
+  mode: custom
+  batch_size: 32
+  eval_period: 1
+  ckpt_period: 50
+  enable_ckpt: True
+  auto_resume: False
+
+model:
+  type: topology_gnn
+  loss_fun: l1
+  lambda_eq: 1.0
+  graph_pooling: none
+
+gt:
+  layer_norm: True  
+  batch_norm: False
+
+gnn:
+  batchnorm: False
+
+topology_gnn:
+  hidden_dim: 128
+  num_layers_old: 3
+  num_layers_new: 3
+  num_diffusion_steps: 4
+  dropout: 0.1
+  residual: True
+  num_heads: 4
+
+optim:
+  clip_grad_norm: True
+  clip_grad_norm_value: 1.0
+  optimizer: adamW
+  weight_decay: 1.0e-5
+  base_lr: 0.001
+  max_epoch: 200
+  scheduler: cosine_with_warmup
+  num_warmup_epochs: 10
+  min_lr: 1.0e-6
+  reduce_factor: 0.5
+  schedule_patience: 20
+  batch_accumulation: 1
