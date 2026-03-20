@@ -664,6 +664,7 @@ class DiffusionCell(nn.Module):
         f_scaled_k: torch.Tensor,      # [E_new, 1]
         edge_index_new: torch.Tensor,  # [2, E_new]
         batch_vec: torch.Tensor,       # [N]
+        apply_global_attn: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
         src, dst = edge_index_new[0], edge_index_new[1]
@@ -687,7 +688,8 @@ class DiffusionCell(nn.Module):
         h_e_new = mini.edge_attr                                          # [E_new, H]
 
         # ── Step 4: Global stream — Self-attention (virtual routing) ─────
-        h_v_new = self.global_attn(h_v_new, batch_vec)                    # [N, H]
+        if apply_global_attn:
+            h_v_new = self.global_attn(h_v_new, batch_vec)                # [N, H]
 
         # ── Step 5: Readout Δf_scaled ─────────────────────────────────────
         delta_f_scaled = self.delta_readout(h_e_new)                      # [E_new, 1]
@@ -759,7 +761,13 @@ class NetworkPairsTopologyModel(nn.Module):
         residual   = cfg.topology_gnn.residual
         num_heads  = cfg.topology_gnn.num_heads
         self.K           = cfg.topology_gnn.num_diffusion_steps
+        self.attention_every_k_steps = int(
+            getattr(cfg.topology_gnn, 'attention_every_k_steps', 1)
+        )
         self.hidden_dim  = hidden_dim
+
+        if self.attention_every_k_steps < 1:
+            raise ValueError("topology_gnn.attention_every_k_steps must be >= 1")
 
         # ── Static edge context encoder (for h_e^(0) initialization) ──────
         # EdgeAlignmentModule produces 8-dim aligned features per new edge:
@@ -965,6 +973,7 @@ class NetworkPairsTopologyModel(nn.Module):
 
         for _k in range(self.K):
             rho_v_scaled = rho_v_k / self.flow_std
+            apply_global_attn = ((_k + 1) % self.attention_every_k_steps == 0)
 
             # ── Neural Darcy's Law: observe (ρ, f) → predict Δf ──────────
             h_v, h_e, delta_f_scaled = self.diffusion_cell(
@@ -974,6 +983,7 @@ class NetworkPairsTopologyModel(nn.Module):
                 f_scaled_k=f_scaled_k,
                 edge_index_new=batch.edge_index_new,
                 batch_vec=batch.batch,
+                apply_global_attn=apply_global_attn,
             )
             # h_v         : [N, H]       updated node hidden
             # h_e         : [E_new, H]   updated edge hidden

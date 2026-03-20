@@ -51,3 +51,7 @@ def topology_gnn_cfg(cfg):
     # Each step applies Neural Darcy's Law: observe pressure → predict Δf → update ρ.
     # More steps → finer-grained equilibrium convergence, but more compute.
     cfg.topology_gnn.num_diffusion_steps = 4
+
+    # Execute global self-attention only every K pseudo-time steps.
+    # Default 1 preserves the original behavior of running attention at each step.
+    cfg.topology_gnn.attention_every_k_steps = 1

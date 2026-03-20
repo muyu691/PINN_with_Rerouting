@@ -57,8 +57,8 @@ model:
   lambda_eq: 1.0
   lambda_old: 1.0
   lambda_new_start: 1.0
-  lambda_new_final: 6.0
-  lambda_new_warmup_epochs: 40
+  lambda_new_final: 2.0
+  lambda_new_warmup_epochs: 50
   lambda_new_schedule: linear
   graph_pooling: none
 
@@ -74,6 +74,7 @@ topology_gnn:
   num_layers_old: 3
   num_layers_new: 3
   num_diffusion_steps: 4
+  attention_every_k_steps: 2
   dropout: 0.1
   residual: True
   num_heads: 4
