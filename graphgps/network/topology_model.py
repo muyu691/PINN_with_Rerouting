@@ -38,6 +38,7 @@ Batch processing note:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.graphgym.config import cfg
 from torch_geometric.graphgym.register import register_network
 from torch_geometric.utils import to_dense_batch
@@ -764,6 +765,10 @@ class NetworkPairsTopologyModel(nn.Module):
         self.attention_every_k_steps = int(
             getattr(cfg.topology_gnn, 'attention_every_k_steps', 1)
         )
+        self.enable_node_potential_head = bool(
+            getattr(cfg.model, 'enable_node_potential_head', False)
+            or float(getattr(cfg.model, 'lambda_rc', 0.0)) > 0.0
+        )
         self.hidden_dim  = hidden_dim
 
         if self.attention_every_k_steps < 1:
@@ -786,6 +791,18 @@ class NetworkPairsTopologyModel(nn.Module):
             dropout=dropout,
             residual=residual,
         )
+
+        # Lightweight node-potential head for the OD-free reduced-cost
+        # surrogate. The loss itself is applied outside forward().
+        if self.enable_node_potential_head:
+            self.node_potential_head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, 1),
+            )
+        else:
+            self.node_potential_head = None
 
         def replace_bn_with_ln(module):
             for name, child in module.named_children():
@@ -899,6 +916,159 @@ class NetworkPairsTopologyModel(nn.Module):
 
         return rho_v_0
 
+    def _attach_real_new_edge_attrs(self, batch) -> None:
+        """Expose real new-graph edge attributes for future physics losses.
+
+        New processed datasets store raw edge attributes directly. For older
+        datasets, fall back to attr_scaler statistics loaded into cfg by the
+        dataset loader so reduced-cost experiments can still recover
+        capacity/speed/length without changing the main model inputs.
+        """
+        if hasattr(batch, 'edge_attr_new_real'):
+            edge_attr_new_real = batch.edge_attr_new_real.to(
+                device=batch.edge_attr_new.device,
+                dtype=batch.edge_attr_new.dtype,
+            )
+        else:
+            attr_mean = getattr(cfg.dataset, 'edge_attr_mean', [])
+            attr_std = getattr(cfg.dataset, 'edge_attr_std', [])
+            edge_dim = batch.edge_attr_new.shape[1]
+            if len(attr_mean) != edge_dim or len(attr_std) != edge_dim:
+                raise RuntimeError(
+                    "Reduced-cost surrogate requires real new-edge attributes. "
+                    "Expected either batch.edge_attr_new_real with columns "
+                    "[capacity, speed, length], or cfg.dataset.edge_attr_mean/std "
+                    "loaded from attr_scaler.pkl so the model can recover those "
+                    "real values from batch.edge_attr_new."
+                )
+            mean = batch.edge_attr_new.new_tensor(attr_mean).view(1, -1)
+            std = batch.edge_attr_new.new_tensor(attr_std).view(1, -1)
+            edge_attr_new_real = batch.edge_attr_new * std + mean
+
+        if not torch.isfinite(edge_attr_new_real).all():
+            bad = int((~torch.isfinite(edge_attr_new_real)).sum().item())
+            raise RuntimeError(
+                f"Recovered real new-edge attributes contain {bad} non-finite values. "
+                f"Reduced-cost surrogate needs finite capacity / speed / length."
+            )
+
+        capacity_new_real = edge_attr_new_real[:, 0:1]
+        speed_raw_new_real = edge_attr_new_real[:, 1:2]
+        length_new_real = edge_attr_new_real[:, 2:3]
+        if torch.any(capacity_new_real <= 0):
+            count = int((capacity_new_real <= 0).sum().item())
+            raise RuntimeError(
+                f"Reduced-cost surrogate requires strictly positive capacity on "
+                f"new edges, but found {count} invalid entries."
+            )
+        if torch.any(speed_raw_new_real <= 0):
+            count = int((speed_raw_new_real <= 0).sum().item())
+            raise RuntimeError(
+                f"Reduced-cost surrogate requires strictly positive speed on "
+                f"new edges, but found {count} invalid entries."
+            )
+        if torch.any(length_new_real <= 0):
+            count = int((length_new_real <= 0).sum().item())
+            raise RuntimeError(
+                f"Reduced-cost surrogate requires strictly positive length on "
+                f"new edges, but found {count} invalid entries."
+            )
+
+        speed_new_real = torch.clamp(speed_raw_new_real, min=1e-6)
+        free_flow_time_new_real = length_new_real / speed_new_real * 60.0
+        if not torch.isfinite(free_flow_time_new_real).all() or torch.any(free_flow_time_new_real <= 0):
+            raise RuntimeError(
+                "Recovered free-flow time contains invalid values. Please check "
+                "the real new-edge capacity / speed / length fields."
+            )
+
+        batch.edge_attr_new_real = edge_attr_new_real
+        batch.capacity_new_real = capacity_new_real
+        batch.speed_new_real = speed_new_real
+        batch.length_new_real = length_new_real
+        batch.free_flow_time_new_real = free_flow_time_new_real
+
+    def _attach_reduced_cost_state(
+        self,
+        batch,
+        f_scaled_final: torch.Tensor,
+        h_v_final: torch.Tensor,
+    ) -> None:
+        """Attach final-step real-space tensors for the OD-free RC surrogate.
+
+        This is not an exact UE / Beckmann path gap because no OD or path set
+        is available at train time. Instead, it builds the final-step KKT
+        ingredients of an OD-free convex transshipment surrogate using only:
+          - node net demand D,
+          - separable edge cost c(f),
+          - node potential phi.
+        The goal is to provide a transparent "cost-driven + conservation"
+        physics prior without introducing OD/path supervision.
+        """
+        rc_bpr_alpha = float(getattr(cfg.model, 'rc_bpr_alpha', 0.15))
+        rc_bpr_beta = float(getattr(cfg.model, 'rc_bpr_beta', 4.0))
+        flow_softplus_scale = max(
+            float(getattr(cfg.model, 'flow_softplus_scale', 5.0)),
+            1e-6,
+        )
+
+        f_real_final = f_scaled_final * self.flow_std + self.flow_mean
+        # Keep both quantities in real flow units:
+        #   - f_cost_pos: smooth positive proxy for cost evaluation
+        #   - f_active  : activity weight for complementarity only
+        f_cost_pos_final = flow_softplus_scale * F.softplus(
+            f_real_final / flow_softplus_scale
+        )
+        f_active_final = torch.relu(f_real_final)
+        if not torch.isfinite(f_real_final).all():
+            raise RuntimeError("Final real-space flow contains NaN/Inf values.")
+        if not torch.isfinite(f_cost_pos_final).all():
+            raise RuntimeError("Final smooth positive flow for the reduced-cost cost branch contains NaN/Inf values.")
+        if not torch.isfinite(f_active_final).all():
+            raise RuntimeError("Final active-flow weight for the reduced-cost branch contains NaN/Inf values.")
+
+        batch.f_real_final = f_real_final
+        batch.f_cost_pos_final = f_cost_pos_final
+        batch.f_active_final = f_active_final
+
+        if self.node_potential_head is None:
+            batch.phi_v_final = None
+            batch.edge_cost_final = None
+            batch.reduced_cost_final = None
+            return
+
+        phi_v_final = self.node_potential_head(h_v_final)
+        if not torch.isfinite(phi_v_final).all():
+            raise RuntimeError("Node-potential head produced NaN/Inf values in phi_v_final.")
+
+        capacity_new_real = torch.clamp(
+            batch.capacity_new_real.to(device=f_cost_pos_final.device, dtype=f_cost_pos_final.dtype),
+            min=1e-6,
+        )
+        free_flow_time_new_real = torch.clamp(
+            batch.free_flow_time_new_real.to(
+                device=f_cost_pos_final.device,
+                dtype=f_cost_pos_final.dtype,
+            ),
+            min=1e-6,
+        )
+        flow_capacity_ratio = torch.clamp(f_cost_pos_final / capacity_new_real, min=0.0, max=1.0e6)
+        edge_cost_final = free_flow_time_new_real * (
+            1.0 + rc_bpr_alpha * torch.pow(flow_capacity_ratio, rc_bpr_beta)
+        )
+        if not torch.isfinite(edge_cost_final).all():
+            raise RuntimeError("BPR edge cost produced NaN/Inf values in edge_cost_final.")
+
+        src = batch.edge_index_new[0]
+        dst = batch.edge_index_new[1]
+        reduced_cost_final = edge_cost_final + phi_v_final[dst] - phi_v_final[src]
+        if not torch.isfinite(reduced_cost_final).all():
+            raise RuntimeError("Reduced-cost surrogate produced NaN/Inf values in reduced_cost_final.")
+
+        batch.phi_v_final = phi_v_final
+        batch.edge_cost_final = edge_cost_final
+        batch.reduced_cost_final = reduced_cost_final
+
     # ================================================================
     # Forward Pass
     # ================================================================
@@ -934,6 +1104,8 @@ class NetworkPairsTopologyModel(nn.Module):
         total_nodes: int = batch.num_nodes
         device = batch.edge_attr_new.device
         dtype = batch.edge_attr_new.dtype
+        if self.enable_node_potential_head:
+            self._attach_real_new_edge_attrs(batch)
 
         # ══════════════════════════════════════════════════════════════════
         # Phase 2: Initial State Projection (k=0)
@@ -1012,5 +1184,15 @@ class NetworkPairsTopologyModel(nn.Module):
         # ══════════════════════════════════════════════════════════════════
         batch.rho_v_final = rho_v_k         # [N, 1]  terminal pressure
         batch.rho_v_history = rho_v_history  # list of K+1 tensors [N, 1]
+
+        # Expose final diffusion states and reduced-cost tensors while keeping
+        # the main model output unchanged.
+        batch.h_v_final = h_v
+        batch.h_e_final = h_e
+        self._attach_reduced_cost_state(
+            batch=batch,
+            f_scaled_final=f_scaled_k,
+            h_v_final=h_v,
+        )
 
         return f_scaled_k, batch.y

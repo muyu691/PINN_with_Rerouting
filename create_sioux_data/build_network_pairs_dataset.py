@@ -158,6 +158,8 @@ def build_single_data_object(
     raw_attr_new = extract_edge_attrs(pair['G_prime'], pair['edge_list_new'])
     norm_attr_old = attr_scaler.transform(raw_attr_old).astype(np.float32)
     norm_attr_new = attr_scaler.transform(raw_attr_new).astype(np.float32)
+    speed_safe_new = np.clip(raw_attr_new[:, 1], a_min=1e-6, a_max=None)
+    free_flow_time_new = (raw_attr_new[:, 2] / speed_safe_new) * 60.0
 
     norm_flow_old = flow_scaler.transform(pair['flows_old'].reshape(-1, 1)).astype(np.float32)
     norm_flow_new = flow_scaler.transform(pair['flows_new'].reshape(-1, 1)).astype(np.float32)
@@ -192,6 +194,12 @@ def build_single_data_object(
         flow_old=torch.from_numpy(norm_flow_old),
         edge_index_new=torch.from_numpy(edge_index_new).long(),
         edge_attr_new=torch.from_numpy(norm_attr_new),
+        # Keep real new-graph edge attributes for the future OD-free
+        # reduced-cost surrogate. The normalized edge_attr_new path remains the
+        # main training input, while these raw tensors provide a stable physics
+        # route for capacity / speed / length / free-flow time.
+        edge_attr_new_real=torch.from_numpy(raw_attr_new.astype(np.float32)),
+        free_flow_time_new_real=torch.from_numpy(free_flow_time_new.astype(np.float32)).view(-1, 1),
         y=torch.from_numpy(norm_flow_new),
         non_centroid_mask=non_centroid_mask,
         net_demand=net_demand,
@@ -306,6 +314,8 @@ def validate_single_data_object(data: Data) -> None:
     assert data.edge_attr_old.shape == (e_old, 3), "edge_attr_old shape error"
     assert data.flow_old.shape == (e_old, 1), "flow_old shape error"
     assert data.edge_attr_new.shape == (e_new, 3), "edge_attr_new shape error"
+    assert data.edge_attr_new_real.shape == (e_new, 3), "edge_attr_new_real shape error"
+    assert data.free_flow_time_new_real.shape == (e_new, 1), "free_flow_time_new_real shape error"
     assert data.y.shape == (e_new, 1), "y shape error"
     assert data.non_centroid_mask.shape == (num_nodes,), "non_centroid_mask shape error"
     assert data.net_demand.shape == (num_nodes,), f"net_demand shape error: {data.net_demand.shape}"
@@ -321,6 +331,8 @@ def validate_single_data_object(data: Data) -> None:
         ('edge_attr_old', data.edge_attr_old),
         ('flow_old', data.flow_old),
         ('edge_attr_new', data.edge_attr_new),
+        ('edge_attr_new_real', data.edge_attr_new_real),
+        ('free_flow_time_new_real', data.free_flow_time_new_real),
         ('y', data.y),
         ('net_demand', data.net_demand),
     ]:
@@ -342,6 +354,7 @@ def validate_single_data_object(data: Data) -> None:
 def save_dataset_metadata(
     output_dir: str,
     example_data: Data,
+    train_dataset: list,
     train_size: int,
     val_size: int,
     test_size: int,
@@ -353,6 +366,15 @@ def save_dataset_metadata(
         for node_id, is_non_centroid in zip(node_ids, example_data.non_centroid_mask.tolist())
         if not is_non_centroid
     ]
+    if len(train_dataset) == 0:
+        raise ValueError("Training dataset is empty, cannot compute global t0 reference.")
+
+    train_free_flow_times = torch.cat(
+        [data.free_flow_time_new_real.view(-1) for data in train_dataset],
+        dim=0,
+    ).float()
+    train_t0_mean = float(train_free_flow_times.mean().item())
+    train_t0_median = float(train_free_flow_times.median().item())
     metadata = {
         'network_name': str(getattr(example_data, 'network_name', 'Unknown')),
         'num_nodes': int(example_data.num_nodes),
@@ -366,6 +388,10 @@ def save_dataset_metadata(
             'train': int(train_size),
             'val': int(val_size),
             'test': int(test_size),
+        },
+        'free_flow_time_ref': {
+            'train_mean': train_t0_mean,
+            'train_median': train_t0_median,
         },
         'files': {
             'train': 'train_dataset.pt',
@@ -391,6 +417,10 @@ def _print_data_summary(data: Data, split_name: str) -> None:
     print(f"    flow_old           : {tuple(data.flow_old.shape)}")
     print(f"    edge_index_new     : {tuple(data.edge_index_new.shape)}")
     print(f"    edge_attr_new      : {tuple(data.edge_attr_new.shape)}")
+    if hasattr(data, 'edge_attr_new_real'):
+        print(f"    edge_attr_new_real : {tuple(data.edge_attr_new_real.shape)}  (raw capacity/speed/length)")
+    if hasattr(data, 'free_flow_time_new_real'):
+        print(f"    free_flow_time_new : {tuple(data.free_flow_time_new_real.shape)}  (minutes)")
     print(f"    y                  : {tuple(data.y.shape)}")
     print(
         f"    non_centroid_mask  : {tuple(data.non_centroid_mask.shape)} "
@@ -487,6 +517,7 @@ def run(args) -> None:
     save_dataset_metadata(
         output_dir=args.output_dir,
         example_data=train_dataset[0],
+        train_dataset=train_dataset,
         train_size=len(train_dataset),
         val_size=len(val_dataset),
         test_size=len(test_dataset),
@@ -524,7 +555,7 @@ def parse_args():
     parser.add_argument(
         '--input_pkl',
         type=str,
-        default='processed_data/pairs/network_pairs_dataset.pkl',
+        default='processed_data/ema_pairs/network_pairs_dataset.pkl',
         help='Path to the pickle output by solve_network_pairs.py',
     )
     parser.add_argument(

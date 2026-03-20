@@ -55,10 +55,30 @@ def _compute_loss(pred, true, batch):
 def _collect_batch_loss_stats(batch):
     """Pull optional PINN diagnostics off the batch for logger aggregation."""
     stats = {}
-    for key in ('loss_old', 'loss_new', 'lambda_new_current', 'loss_data', 'loss_eq'):
+    for key in (
+        'loss_old',
+        'loss_new',
+        'lambda_new_current',
+        'lambda_rc_current',
+        'loss_data',
+        'loss_eq',
+        'loss_rc',
+        'loss_rc_nonneg',
+        'loss_rc_comp',
+        'loss_rc_gauge',
+        'reduced_cost_mean',
+        'reduced_cost_min',
+        'reduced_cost_max',
+        'phi_mean',
+        'phi_std',
+        'f_active_mean',
+        'f_active_max',
+    ):
         if not hasattr(batch, key):
             continue
         value = getattr(batch, key)
+        if value is None:
+            continue
         if torch.is_tensor(value):
             value = value.detach().cpu().item()
         stats[key] = float(value)

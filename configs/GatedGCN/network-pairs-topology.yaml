@@ -60,6 +60,24 @@ model:
   lambda_new_final: 2.0
   lambda_new_warmup_epochs: 50
   lambda_new_schedule: linear
+  # Enable the node-potential head used by the OD-free reduced-cost surrogate.
+  enable_node_potential_head: True
+  # Final outer weight on the OD-free reduced-cost surrogate after warmup.
+  lambda_rc: 0.05
+  # Warm up lambda_rc linearly so flow fitting stabilizes before RC regularization dominates.
+  lambda_rc_warmup_epochs: 40
+  # Weight on reduced-cost nonnegativity: ReLU(-r_e)^2.
+  lambda_rc_nonneg: 1.0
+  # Weight on complementarity: f_active * ReLU(r_e)^2.
+  lambda_rc_comp: 1.0
+  # Weak gauge fix on node potentials: mean(phi)^2.
+  lambda_rc_gauge: 0.1
+  # Smooth positive flow scale used only in f_cost_pos for the BPR cost branch.
+  flow_softplus_scale: 5.0
+  # BPR alpha in c_e(f)=t0*(1 + alpha*(f/cap)^beta).
+  rc_bpr_alpha: 0.15
+  # BPR beta in c_e(f)=t0*(1 + alpha*(f/cap)^beta).
+  rc_bpr_beta: 4.0
   graph_pooling: none
 
 gt:
@@ -74,6 +92,7 @@ topology_gnn:
   num_layers_old: 3
   num_layers_new: 3
   num_diffusion_steps: 4
+  # Apply global attention every K pseudo-time steps; 1 recovers the original per-step attention.
   attention_every_k_steps: 2
   dropout: 0.1
   residual: True

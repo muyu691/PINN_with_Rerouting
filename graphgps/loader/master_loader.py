@@ -719,6 +719,15 @@ def preformat_NetworkPairs(dataset_dir, name):
         logging.info(
             f"[preformat_NetworkPairs] Loaded dataset metadata from {metadata_path}"
         )
+        free_flow_time_meta = metadata.get('free_flow_time_ref', {})
+        if 'train_mean' in free_flow_time_meta:
+            cfg.dataset.free_flow_time_ref = float(free_flow_time_meta['train_mean'])
+            logging.info(
+                f"[preformat_NetworkPairs] Loaded global training t0_ref from metadata: "
+                f"{cfg.dataset.free_flow_time_ref:.6f} minutes"
+            )
+
+    meta_files = metadata.get('files', {}) if osp.exists(metadata_path) else {}
 
     # -- Step 1: Dynamically load flow_scaler and inject denormalization parameters --
     #
@@ -726,7 +735,8 @@ def preformat_NetworkPairs(dataset_dir, name):
     #   - The loader executes before training starts, ensuring cfg has correct params at model initialization.
     #   - Storing scaler meta-info in cfg (not passing into model) fits GraphGPS's config-driven paradigm.
     #   - Avoid repeated I/O operations in hot loop (every batch).
-    scaler_path = osp.join(actual_dir, 'scalers', 'flow_scaler.pkl')
+    flow_scaler_relpath = meta_files.get('flow_scaler', osp.join('scalers', 'flow_scaler.pkl'))
+    scaler_path = osp.join(actual_dir, flow_scaler_relpath)
 
     try:
         with open(scaler_path, 'rb') as f:
@@ -764,11 +774,51 @@ def preformat_NetworkPairs(dataset_dir, name):
             f"Please ensure this is a sklearn.preprocessing.StandardScaler object."
         ) from e
 
+    # -- Step 1b: Load attr_scaler for real-space edge-attribute recovery --
+    attr_scaler_relpath = meta_files.get('attr_scaler', osp.join('scalers', 'attr_scaler.pkl'))
+    attr_scaler_path = osp.join(actual_dir, attr_scaler_relpath)
+    try:
+        with open(attr_scaler_path, 'rb') as f:
+            attr_scaler = pickle.load(f)
+
+        cfg.dataset.edge_attr_mean = [float(x) for x in attr_scaler.mean_]
+        cfg.dataset.edge_attr_std = [float(x) for x in attr_scaler.scale_]
+
+        logging.info(
+            f"[preformat_NetworkPairs] Successfully loaded attr_scaler from {attr_scaler_path}\n"
+            f"  edge_attr_mean = {cfg.dataset.edge_attr_mean}\n"
+            f"  edge_attr_std  = {cfg.dataset.edge_attr_std}\n"
+            f"  (Used as a fallback to recover real capacity / speed / length)"
+        )
+    except FileNotFoundError:
+        logging.warning(
+            f"[preformat_NetworkPairs] attr_scaler not found at {attr_scaler_path}. "
+            f"New processed datasets should store raw edge attributes directly; "
+            f"older datasets without those raw fields will not support real-space "
+            f"edge-attribute recovery."
+        )
+
     # -- Step 2: Load three splits and merge into unified dataset --
-    dataset = join_dataset_splits(
-        [NetworkPairsTopologyDataset(root=actual_dir, split=split)
-         for split in ['train', 'val', 'test']]
-    )
+    split_datasets = [
+        NetworkPairsTopologyDataset(root=actual_dir, split=split)
+        for split in ['train', 'val', 'test']
+    ]
+    if float(getattr(cfg.dataset, 'free_flow_time_ref', 0.0)) <= 0.0:
+        train_free_flow_time = getattr(split_datasets[0].data, 'free_flow_time_new_real', None)
+        if train_free_flow_time is None:
+            raise RuntimeError(
+                "Reduced-cost surrogate requires a global training-set t0_ref. "
+                "Expected dataset_meta.json['free_flow_time_ref']['train_mean'] or "
+                "train split tensors with free_flow_time_new_real."
+            )
+        train_free_flow_time = train_free_flow_time.float()
+        cfg.dataset.free_flow_time_ref = float(train_free_flow_time.mean().item())
+        logging.info(
+            f"[preformat_NetworkPairs] Computed global training t0_ref from train split: "
+            f"{cfg.dataset.free_flow_time_ref:.6f} minutes"
+        )
+
+    dataset = join_dataset_splits(split_datasets)
     return dataset
 
 

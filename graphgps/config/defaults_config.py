@@ -34,6 +34,15 @@ def extended_cfg(cfg):
     cfg.model.lambda_new_final = 6.0
     cfg.model.lambda_new_warmup_epochs = 40
     cfg.model.lambda_new_schedule = 'linear'
+    cfg.model.enable_node_potential_head = False
+    cfg.model.lambda_rc = 0.05
+    cfg.model.lambda_rc_warmup_epochs = 40
+    cfg.model.lambda_rc_nonneg = 1.0
+    cfg.model.lambda_rc_comp = 1.0
+    cfg.model.lambda_rc_gauge = 0.1
+    cfg.model.flow_softplus_scale = 5.0
+    cfg.model.rc_bpr_alpha = 0.15
+    cfg.model.rc_bpr_beta = 4.0
 
     # Runtime-only field injected by the custom train loop so the loss can read
     # the current epoch without changing the loss function signature.

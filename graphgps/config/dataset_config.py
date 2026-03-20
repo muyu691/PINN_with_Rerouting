@@ -33,6 +33,13 @@ def dataset_cfg(cfg):
     # Flow de-normalization parameters injected by the dataset loader.
     cfg.dataset.flow_mean = 0.0
     cfg.dataset.flow_std = 1.0
+    cfg.dataset.free_flow_time_ref = 0.0
+
+    # Edge-attribute scaler statistics injected by the dataset loader. These
+    # allow recovering real [capacity, speed, length] values when older
+    # processed datasets do not yet store raw edge attributes explicitly.
+    cfg.dataset.edge_attr_mean = []
+    cfg.dataset.edge_attr_std = []
 
     # Feature / routing flags kept for backward compatibility.
     cfg.dataset.use_virtual_links = True

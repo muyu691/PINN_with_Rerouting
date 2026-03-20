@@ -79,6 +79,38 @@ class CustomLogger(Logger):
             stats['gpu_memory'] = gpu_memory
         return stats
 
+    def custom(self):
+        """Keep RC diagnostics visible and stable in epoch-level logs."""
+        stats = super().custom()
+        rc_keys = [
+            'loss_old',
+            'loss_new',
+            'loss_data',
+            'loss_eq',
+            'loss_rc',
+            'loss_rc_nonneg',
+            'loss_rc_comp',
+            'loss_rc_gauge',
+            'lambda_new_current',
+            'lambda_rc_current',
+            'reduced_cost_mean',
+            'reduced_cost_min',
+            'reduced_cost_max',
+            'phi_mean',
+            'phi_std',
+            'f_active_mean',
+            'f_active_max',
+        ]
+        if not any(key in stats for key in rc_keys):
+            return stats
+
+        ordered_stats = {}
+        for key in rc_keys:
+            if key in stats:
+                ordered_stats[key] = stats.pop(key)
+        ordered_stats.update(stats)
+        return ordered_stats
+
     # task properties
     def classification_binary(self):
         true = torch.cat(self._true).squeeze(-1)
